@@ -1,50 +1,54 @@
 """
-N-Queens v4: bitmask constraint propagation.
+N-Queens v5: iterative bitmask solver (explicit stack, no recursion).
 
-Instead of sets, represent constraints as three integers:
-  cols  — columns already attacked (bit i = column i is occupied)
-  left  — left diagonals attacking downward (shift left each row)
-  right — right diagonals attacking downward (shift right each row)
-
-Available columns = all_ones & ~(cols | left | right)
-Extract next candidate with: bit = candidates & -candidates (lowest set bit)
-Clear it with: candidates &= candidates - 1
-
-No hashing, no heap allocation — just integer bitwise ops per node.
-Still uses bilateral symmetry from v3.
+Python function calls cost ~200ns each. For N=16 that's tens of millions
+of calls. We replace the call stack with an explicit stack of tuples and
+drive the search with a single while-loop — same bitmask math, zero call
+overhead. Bilateral symmetry from v3 still halves the first-row work.
 """
 
 import time
 
 
 def count_solutions(n):
-    full = (1 << n) - 1  # bitmask with all n columns set
-
-    def solve(cols, left, right):
-        if cols == full:
-            return 1
-        count = 0
-        candidates = full & ~(cols | left | right)
-        while candidates:
-            bit = candidates & -candidates          # isolate lowest set bit
-            candidates &= candidates - 1            # clear it
-            count += solve(
-                cols | bit,
-                (left  | bit) << 1,
-                (right | bit) >> 1,
-            )
-        return count
-
-    # Bilateral symmetry: search left half of row 0, double each subtree
+    full = (1 << n) - 1
     count = 0
+
+    def search(cols0, left0, right0):
+        nonlocal count
+        if cols0 == full:
+            count += 1
+            return
+        # Stack entries: (cols, left, right, candidates)
+        candidates0 = full & ~(cols0 | left0 | right0)
+        stack = [(cols0, left0, right0, candidates0)]
+        while stack:
+            cols, left, right, cands = stack[-1]
+            if not cands:
+                stack.pop()
+                continue
+            # Pick and clear the lowest candidate bit in-place
+            bit = cands & -cands
+            stack[-1] = (cols, left, right, cands & (cands - 1))
+            new_cols = cols | bit
+            if new_cols == full:
+                count += 1
+                continue
+            new_left  = (left  | bit) << 1
+            new_right = (right | bit) >> 1
+            new_cands = full & ~(new_cols | new_left | new_right)
+            if new_cands:
+                stack.append((new_cols, new_left, new_right, new_cands))
+
     for col in range(n // 2):
         bit = 1 << col
-        sub = solve(bit, bit << 1, bit >> 1)
-        count += sub * 2
+        before = count
+        search(bit, bit << 1, bit >> 1)
+        count += (count - before)   # double the subtree count
 
     if n % 2 == 1:
         bit = 1 << (n // 2)
-        count += solve(bit, bit << 1, bit >> 1)
+        search(bit, bit << 1, bit >> 1)
 
     return count
 
