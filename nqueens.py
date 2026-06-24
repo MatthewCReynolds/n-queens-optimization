@@ -1,22 +1,31 @@
 """
-N-Queens v9: unit propagation + Numba thread-parallel 2-row dispatch.
+N-Queens v10: MRV (Minimum Remaining Values) + Numba thread-parallel.
 
-Two new techniques replacing v8's approach:
+Core idea: instead of placing queens row-by-row (rows 0, 1, 2, ...),
+at each step choose the UNPLACED ROW with the fewest valid columns
+remaining. This is the "fail-first" MRV heuristic from constraint
+satisfaction (Russell & Norvig §6.3, Haralick & Elliott 1980).
 
-1. Unit propagation (singleton forcing):
-   If the next row has exactly ONE valid column, that move is forced —
-   no branching needed. Detect via x & (x-1) == 0 in O(1). Chain through
-   consecutive forced moves without any recursive calls. Near-zero overhead,
-   high payoff near the leaves of the search tree where rows get highly
-   constrained. (Standard CSP unit propagation / DPLL unit clause rule.)
+Why it matters: adjacent queens immediately constrain nearby rows.
+MRV detects when those rows are empty (dead end) BEFORE reaching them
+in row order — potentially skipping entire subtrees. For N-queens, two
+queens placed in the middle of the board can block a distant row
+completely; row-by-row backtracking wouldn't discover this until it
+actually reached that row.
 
-2. Numba @njit(parallel=True) with prange — no multiprocessing:
-   Replace ProcessPoolExecutor with Numba's OpenMP thread pool. Tasks
-   (first two queen positions) are dispatched to threads inside the JIT —
-   zero process-spawn overhead, shared memory, starts in microseconds.
-   For N=19: ~144 tasks across ~8 cores vs v7/v8's 9 tasks.
-   This also eliminates the ~18s of process-spawn overhead eaten by N=1-16
-   in v7/v8 — those now run single-threaded Numba in <0.01s each.
+State per node: avail[r] = bitmask of still-valid columns for row r.
+After placing queen at (r0, bit):
+    delta = |r - r0|
+    avail[r] &= ~(bit | (bit << delta) | (bit >> delta))
+This propagates column, left-diagonal, and right-diagonal constraints
+to ALL unplaced rows simultaneously, not just the next one.
+
+Unit propagation is implicit: MRV will select a row with avail=1 (one
+option) before any row with more options. Those forced placements chain
+without any branch overhead.
+
+No explicit forward checking needed — avail[r]==0 is checked during
+MRV selection and propagation (prune immediately on domain wipeout).
 """
 
 import time
@@ -25,57 +34,102 @@ from numba import njit, prange
 
 
 @njit
-def _solve(cols, left, right, full, depth, n):
-    # Unit propagation: fast-path through forced placements
-    while True:
-        if cols == full:
-            return 1
-        cands = full & ~(cols | left | right)
-        if not cands:
-            return 0
-        if cands & (cands - 1):  # more than one bit → must branch
-            break
-        # Exactly one candidate — forced, no branching
-        cols  |= cands
-        left   = (left  | cands) << 1
-        right  = (right | cands) >> 1
-        depth += 1
+def _popcount(x):
+    c = 0
+    while x:
+        c += 1
+        x &= x - 1
+    return c
 
+
+@njit
+def _solve_mrv(avail, placed, depth, n, full):
+    if depth == n:
+        return 1
+
+    # MRV: find the unplaced row with the smallest domain
+    best_row = -1
+    best_cnt = n + 1
+    for r in range(n):
+        if not placed[r]:
+            cnt = _popcount(avail[r])
+            if cnt == 0:
+                return 0      # domain wipeout — dead end
+            if cnt < best_cnt:
+                best_cnt = cnt
+                best_row = r
+
+    # Save avail state before we try candidates
+    saved = avail.copy()
+    placed[best_row] = True
     count = 0
+
+    cands = saved[best_row]
     while cands:
-        bit    = cands & -cands          # lowest set bit
-        cands &= cands - 1              # clear it
-        nc = cols | bit
-        nl = (left  | bit) << 1
-        nr = (right | bit) >> 1
-        # Forward checking: prune if any future row becomes empty
-        ok = True
-        fl, fr = nl, nr
-        for _ in range(n - depth - 1):
-            if not (full & ~(nc | fl | fr)):
-                ok = False
-                break
-            fl <<= 1
-            fr >>= 1
-        if ok:
-            count += _solve(nc, nl, nr, full, depth + 1, n)
+        bit    = cands & -cands      # lowest candidate
+        cands &= cands - 1
+
+        # Reset avail to pre-branch state
+        avail[:] = saved
+
+        # Propagate: queen placed at (best_row, col=log2(bit))
+        valid = True
+        for r in range(n):
+            if not placed[r]:
+                d = best_row - r
+                if d < 0:
+                    d = -d
+                removed = bit | ((bit << d) & full) | (bit >> d)
+                avail[r] = avail[r] & ~removed & full
+                if avail[r] == 0:
+                    valid = False
+                    break
+
+        if valid:
+            count += _solve_mrv(avail, placed, depth + 1, n, full)
+
+    avail[:] = saved
+    placed[best_row] = False
     return count
 
 
 @njit(parallel=True)
 def _count_parallel(tasks, n):
-    """Dispatch (col0, col1) pairs to Numba threads via prange."""
+    """Dispatch (col0, col1) pre-placed pairs to Numba threads via prange."""
     full   = (1 << n) - 1
     counts = np.zeros(tasks.shape[0], dtype=np.int64)
+
     for i in prange(tasks.shape[0]):
-        col0  = tasks[i, 0]
-        col1  = tasks[i, 1]
-        bit0  = 1 << col0
-        bit1  = 1 << col1
-        cols  = bit0 | bit1
-        left  = ((bit0 << 1) | bit1) << 1
-        right = ((bit0 >> 1) | bit1) >> 1
-        counts[i] = _solve(cols, left, right, full, 2, n)
+        col0 = tasks[i, 0]
+        col1 = tasks[i, 1]
+        bit0 = np.int64(1) << col0
+        bit1 = np.int64(1) << col1
+
+        avail  = np.full(n, full, dtype=np.int64)
+        placed = np.zeros(n, dtype=np.bool_)
+
+        # Pre-place queen 0 at (row 0, col0)
+        placed[0] = True
+        avail[0]  = np.int64(0)
+        for r in range(1, n):
+            d       = r
+            removed = bit0 | ((bit0 << d) & full) | (bit0 >> d)
+            avail[r] = avail[r] & ~removed & full
+
+        # Pre-place queen 1 at (row 1, col1) if still valid
+        if avail[1] & bit1:
+            placed[1] = True
+            avail[1]  = np.int64(0)
+            for r in range(n):
+                if not placed[r]:
+                    d       = 1 - r
+                    if d < 0:
+                        d = -d
+                    removed = bit1 | ((bit1 << d) & full) | (bit1 >> d)
+                    avail[r] = avail[r] & ~removed & full
+
+            counts[i] = _solve_mrv(avail, placed, 2, n, full)
+
     return counts
 
 
@@ -84,8 +138,8 @@ def count_solutions(n):
         return 1
     full = (1 << n) - 1
 
-    half_tasks   = []  # col0 < n//2, results doubled
-    center_tasks = []  # col0 = n//2 for odd n, not doubled
+    half_tasks   = []
+    center_tasks = []
 
     for col0 in range(n // 2):
         bit0  = 1 << col0
@@ -119,7 +173,6 @@ def count_solutions(n):
 
 
 if __name__ == "__main__":
-    # Warm up Numba compilation before the clock starts
     _count_parallel(np.array([[0, 2]], dtype=np.int64), 4)
 
     deadline = time.time() + 60.0
