@@ -1,8 +1,10 @@
 """
-N-Queens v2: O(1) conflict checking with sets.
+N-Queens v3: bilateral symmetry halves the search tree.
 
-Track occupied columns, / diagonals, and \\ diagonals as sets.
-No more walking up the board on every placement — just O(1) membership tests.
+Every solution with the first queen at column c has a mirror solution
+with the first queen at column (n-1-c). So we only search the left half
+of row 0 and double the count. For odd N, the center column is searched
+separately without doubling.
 """
 
 import time
@@ -10,8 +12,8 @@ import time
 
 def count_solutions(n):
     cols = set()
-    diag1 = set()  # (row - col) is constant along each / diagonal
-    diag2 = set()  # (row + col) is constant along each \\ diagonal
+    diag1 = set()
+    diag2 = set()
     count = 0
 
     def solve(row):
@@ -31,7 +33,23 @@ def count_solutions(n):
             diag1.remove(d1)
             diag2.remove(d2)
 
-    solve(0)
+    # Search only the left half of row 0, mirror each result
+    for col in range(n // 2):
+        d1, d2 = -col, col
+        cols.add(col); diag1.add(d1); diag2.add(d2)
+        before = count
+        solve(1)
+        count = before + (count - before) * 2  # each solution has a mirror
+        cols.remove(col); diag1.remove(d1); diag2.remove(d2)
+
+    # For odd N, the center column has no mirror — count it once
+    if n % 2 == 1:
+        col = n // 2
+        d1, d2 = -col, col
+        cols.add(col); diag1.add(d1); diag2.add(d2)
+        solve(1)
+        cols.remove(col); diag1.remove(d1); diag2.remove(d2)
+
     return count
 
 
