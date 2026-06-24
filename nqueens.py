@@ -1,10 +1,19 @@
 """
-N-Queens v7: multiprocessing + Numba JIT.
+N-Queens v8: forward checking + 2-row dispatch + Numba + multiprocessing.
 
-The n//2 first-row subtrees from bilateral symmetry are completely
-independent. We dispatch each to a worker process via ProcessPoolExecutor,
-where Numba re-JITs and runs natively. On an 8-12 core M-series Mac that's
-another ~8-12x on top of v6's 33x JIT speedup.
+Two simultaneous upgrades over v7:
+
+1. Forward checking (Russell & Norvig §6.3 / arc consistency look-ahead):
+   After tentatively placing each queen, scan ALL remaining rows to verify
+   each still has at least one valid column. Any future row with zero options
+   means this branch can never succeed — prune it immediately without
+   recursing. Adds O(n) work per node but eliminates entire subtrees the
+   pure bitmask solver would explore.
+
+2. Two-row dispatch: fix BOTH row 0 and row 1 queen positions before
+   dispatching to worker processes. For N=19 this yields ~144 tasks vs v7's
+   9, near-perfect load balance across cores. The longest v7 task (central
+   first-row column) now splits into ~16 sub-tasks of similar size.
 """
 
 import time
@@ -13,7 +22,7 @@ from numba import njit
 
 
 @njit
-def _solve(cols, left, right, full):
+def _solve_fc(cols, left, right, full, depth, n):
     if cols == full:
         return 1
     count = 0
@@ -21,43 +30,78 @@ def _solve(cols, left, right, full):
     while candidates:
         bit = candidates & -candidates
         candidates &= candidates - 1
-        count += _solve(cols | bit, (left | bit) << 1, (right | bit) >> 1, full)
+        nc = cols | bit
+        nl = (left | bit) << 1
+        nr = (right | bit) >> 1
+        # Forward checking: verify every future row still has candidates
+        ok = True
+        fl, fr = nl, nr
+        for _ in range(n - depth - 1):
+            if not (full & ~(nc | fl | fr)):
+                ok = False
+                break
+            fl <<= 1
+            fr >>= 1
+        if ok:
+            count += _solve_fc(nc, nl, nr, full, depth + 1, n)
     return count
 
 
 @njit
-def _solve_from(col, n):
-    """Count solutions with the first queen fixed at (row=0, col=col)."""
+def _solve_from_two(col0, col1, n):
+    """Solve with queens pre-placed at (row=0, col0) and (row=1, col1)."""
     full = (1 << n) - 1
-    bit  = 1 << col
-    return _solve(bit, bit << 1, bit >> 1, full)
+    bit0 = 1 << col0
+    bit1 = 1 << col1
+    cols  = bit0 | bit1
+    left  = ((bit0 << 1) | bit1) << 1
+    right = ((bit0 >> 1) | bit1) >> 1
+    return _solve_fc(cols, left, right, full, 2, n)
 
 
 def _worker(args):
-    col, n = args
-    # Each worker process JITs on first call, then runs natively.
-    return int(_solve_from(col, n))
+    col0, col1, n = args
+    return int(_solve_from_two(col0, col1, n))
 
 
 def count_solutions(n):
-    half = n // 2
-    tasks = [(col, n) for col in range(half)]
+    if n == 1:
+        return 1
+    full = (1 << n) - 1
 
-    with ProcessPoolExecutor() as pool:
-        subtree_counts = list(pool.map(_worker, tasks))
+    tasks_half   = []  # col0 < n//2 — each subtree gets doubled
+    tasks_center = []  # col0 = n//2 for odd n — no doubling
 
-    total = sum(subtree_counts) * 2
+    for col0 in range(n // 2):
+        bit0 = 1 << col0
+        avail = full & ~(bit0 | (bit0 << 1) | (bit0 >> 1))
+        c = avail
+        while c:
+            bit1 = c & -c
+            c &= c - 1
+            tasks_half.append((col0, bit1.bit_length() - 1, n))
 
-    # Center column for odd N — no mirror partner.
     if n % 2 == 1:
-        total += _worker((n // 2, n))
+        col0 = n // 2
+        bit0 = 1 << col0
+        avail = full & ~(bit0 | (bit0 << 1) | (bit0 >> 1))
+        c = avail
+        while c:
+            bit1 = c & -c
+            c &= c - 1
+            tasks_center.append((col0, bit1.bit_length() - 1, n))
 
+    all_tasks = tasks_half + tasks_center
+    with ProcessPoolExecutor() as pool:
+        results = list(pool.map(_worker, all_tasks))
+
+    total  = sum(results[:len(tasks_half)]) * 2
+    total += sum(results[len(tasks_half):])
     return total
 
 
 if __name__ == "__main__":
-    # Warm up Numba in the main process (workers JIT independently).
-    _solve_from(0, 4)
+    _solve_from_two(0, 2, 4)  # warm up Numba JIT before the clock
 
     deadline = time.time() + 60.0
     n = 1
